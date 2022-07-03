@@ -392,7 +392,7 @@ class Simulator {
       } else {
         if (predict_table[hash][his] > 0) --predict_table[hash][his];
       }
-      branch_history[hash] = ((his << 1) & his_mask) | (u32)1;
+      branch_history[hash] = ((his << 1) & his_mask) | jump;
     }
     void CountResult(bool success) {
       ++total_cnt;
