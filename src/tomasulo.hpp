@@ -8,9 +8,13 @@ using u16 = u_int16_t;
 using i32 = int32_t;
 using u8 = u_int8_t;
 
-constexpr const u32 MEM_SIZE = 500000, RS_SIZE = 32, SLB_SIZE = 32, ROB_SIZE = 32, INST_QUEUE_SIZE = 32, REG_SIZE = 32;
+constexpr const u32 kMemorySize = 500000;
+constexpr const u32 kReservationStationSize = 32, kStoreLoadBufferSize = 32, kReorderBufferSize = 32,
+                    kInstQueueSize = 32, kRegisterSize = 32;
+constexpr const u32 kBranchPredictorSize = 512;
+constexpr const u8 kBranchPredictorHistoryLen = 3;
 
-template <u32 kSize = MEM_SIZE>
+template <u32 kSize = kMemorySize>
 class Memory {
   u8 mem_[kSize];
   u32 pos = 0;
@@ -280,12 +284,12 @@ struct Instruction {
   bool IsStore() const { return opcode == 0b0100011; }
   bool IsLoad() const { return opcode == 0b0000011; }
   bool IsStoreLoad() const { return IsStore() || IsLoad(); }
+  bool IsBranch() const { return opcode == 0b1100011; }
+  bool IsJump() const { return inst_type == JAL || inst_type == JALR; }
   bool NeedWriteReg() const {
-    return opcode != 0b0100011 && opcode != 0b1100011 && rd != 0;
+    return !IsStore() && !IsBranch() && rd != 0;
   }
-  bool IsJumpBranch() const {
-    return opcode == 0b1100011 || inst_type == JAL || inst_type == JALR;
-  }
+  bool IsJumpBranch() const { return IsBranch() || IsJump(); }
   // clang-format on
 };
 
@@ -293,7 +297,7 @@ struct Register {
   u32 val, rob;
 };
 
-template <u32 kSize = REG_SIZE>
+template <u32 kSize = kRegisterSize>
 struct RegisterFile {
   Register reg[kSize];
   Register &operator[](u32 i) { return reg[i]; }
@@ -317,6 +321,7 @@ class Simulator {
   struct InstQueueItem {
     Instruction inst;
     u32 pc;
+    bool predict_jump = false;
   };
   struct ReservationStationItem {
     bool ready = true;
@@ -324,7 +329,7 @@ class Simulator {
     u32 rs1_val, rs1_rob, rs2_val, rs2_rob, rd_rob;
     u32 imm, pc;
   };
-  template <u32 kSize = RS_SIZE>
+  template <u32 kSize = kReservationStationSize>
   class ReservationStation {
    public:
     ReservationStationItem node_[kSize];
@@ -350,6 +355,7 @@ class Simulator {
     bool ready = false;
     Instruction inst;
     u32 reg_id, rs_id, slb_id;
+    bool predict_jump = false;
     ex_result_t result;
   };
   struct StoreLoadBufferItem {
@@ -360,10 +366,44 @@ class Simulator {
     bool committed;
   };
 
-  LoopQueue<InstQueueItem, INST_QUEUE_SIZE> inst_queue_prev, inst_queue_next;
+  LoopQueue<InstQueueItem, kInstQueueSize> inst_queue_prev, inst_queue_next;
   ReservationStation<> rs_prev, rs_next;
-  LoopQueue<StoreLoadBufferItem, SLB_SIZE> slb_prev, slb_next;
-  LoopQueue<ReorderBufferItem, ROB_SIZE> rob_prev, rob_next;
+  LoopQueue<StoreLoadBufferItem, kStoreLoadBufferSize> slb_prev, slb_next;
+  LoopQueue<ReorderBufferItem, kReorderBufferSize> rob_prev, rob_next;
+
+  template <u32 kSize = kBranchPredictorSize, u8 kHisLen = kBranchPredictorHistoryLen>
+  class BranchPredictor {
+    u8 predict_table[kSize][1 << kHisLen] = {};
+    u32 branch_history[kSize] = {};
+    u32 total_cnt = 0, success_cnt = 0;
+    static constexpr const u32 his_mask = (1u << kHisLen) - 1;
+    inline u32 Hash(u32 pc) { return pc % kSize; }
+
+   public:
+    // true: jump; false: not jump
+    bool Predict(u32 pc) {
+      auto hash = Hash(pc);
+      return predict_table[hash][branch_history[hash]] > 1;
+    }
+    void RecordBranch(u32 pc, bool jump) {
+      auto hash = Hash(pc), his = branch_history[hash];
+      if (jump) {
+        if (predict_table[hash][his] < 3) ++predict_table[hash][his];
+      } else {
+        if (predict_table[hash][his] > 0) --predict_table[hash][his];
+      }
+      branch_history[hash] = ((his << 1) & his_mask) | (u32)1;
+    }
+    void CountResult(bool success) {
+      ++total_cnt;
+      if (success) ++success_cnt;
+    }
+    void PrintCount() {
+      fprintf(stderr, "total branch number:%d, successfully predicted:%d, rate:%f", total_cnt, success_cnt,
+          (double)success_cnt / (double)total_cnt);
+    }
+  };
+  BranchPredictor<> predictor;
 
   struct issue_to_slb_t {
     Instruction inst;
@@ -419,6 +459,11 @@ class Simulator {
     bool clear_all = 0;
   } signal;
 
+  ex_result_t ExecuteBranch(u32 inst_pc, u32 imm, bool jump) {
+    predictor.RecordBranch(inst_pc, jump);
+    return ex_result_t{0, jump ? inst_pc + imm : inst_pc + 4, jump};
+  }
+
   ex_result_t ExecuteInst(Instruction inst, u32 v1, u32 v2, u32 imm, u32 pc) {
     switch (inst.inst_type) {
       case Instruction::LUI: return ex_result_t{imm, 0, 0};
@@ -427,12 +472,12 @@ class Simulator {
       case Instruction::JAL: return ex_result_t{pc + 4, pc + imm, 1};
       case Instruction::JALR: return ex_result_t{pc + 4, (v1 + imm) & ~(u32)1, 1};
 
-      case Instruction::BEQ: return ex_result_t{0, pc + imm, v1 == v2};
-      case Instruction::BNE: return ex_result_t{0, pc + imm, v1 != v2};
-      case Instruction::BLT: return ex_result_t{0, pc + imm, (i32)v1 < (i32)v2};
-      case Instruction::BGE: return ex_result_t{0, pc + imm, (i32)v1 >= (i32)v2};
-      case Instruction::BLTU: return ex_result_t{0, pc + imm, v1 < v2};
-      case Instruction::BGEU: return ex_result_t{0, pc + imm, v1 >= v2};
+      case Instruction::BEQ: return ExecuteBranch(pc, imm, v1 == v2);
+      case Instruction::BNE: return ExecuteBranch(pc, imm, v1 != v2);
+      case Instruction::BLT: return ExecuteBranch(pc, imm, (i32)v1 < (i32)v2);
+      case Instruction::BGE: return ExecuteBranch(pc, imm, (i32)v1 >= (i32)v2);
+      case Instruction::BLTU: return ExecuteBranch(pc, imm, v1 < v2);
+      case Instruction::BGEU: return ExecuteBranch(pc, imm, v1 >= v2);
 
       case Instruction::LB: return ex_result_t{Instruction::SignExtend(mem.GetByte(v1 + imm), 8), 0, 0};
       case Instruction::LH: return ex_result_t{Instruction::SignExtend(mem.GetHalfWord(v1 + imm), 16), 0, 0};
@@ -479,12 +524,12 @@ class Simulator {
       */
 
 #ifdef LTC
-      if (cycle > 100000000) {
+      if (cycle > 10000) {
         puts("Infinite loop!");
         break;
       }
       printf("---\nCycle %d, reg_prev:", cycle);
-      for (u32 i = 0; i < REG_SIZE; ++i) {
+      for (u32 i = 0; i < kRegisterSize; ++i) {
         if (i % 8 == 0) puts("");
         printf("%6d,%d ", reg_prev[i].val, reg_prev[i].rob);
       }
@@ -500,13 +545,14 @@ class Simulator {
       if (rob_to_commit) {
         const auto &inst = rob_to_commit->inst;
         const auto &res = rob_to_commit->result;
-        printf("rob to commit rob:%d res val:%d reg#%d jump?%d ", rob_to_commit->rob_id, res.value,
-            rob_to_commit->reg_id, res.jump);
+        printf("rob to commit rob:%d res val:%d reg#%d jump?%d to_pc:%d ", rob_to_commit->rob_id, res.value,
+            rob_to_commit->reg_id, res.jump, res.pc);
         inst.Print();
       }
 #endif  // LTC
       if (rob_to_commit && rob_to_commit->inst.inst == 0x0ff00513) {
         printf("%u\n", reg_prev[10].val & 255u);
+        predictor.PrintCount();
         break;
       }
 
@@ -537,13 +583,25 @@ class Simulator {
     }
     if (!inst_queue_next.full()) {
       Instruction inst{mem.GetWord(pc)};
-      inst_queue_next.push({inst, pc});
+      auto inst_pc = pc;
+      bool predict_jump = false;
 #ifdef LTC
       printf("fetch ");
       inst.Print(false);
       printf(" pc:%d\n", pc);
 #endif  // LTC
-      pc += 4;
+      if (inst.inst_type == Instruction::JAL) {
+        pc += inst.imm;
+      } else if (inst.IsBranch()) {
+        predict_jump = predictor.Predict(inst_pc);
+        if (predict_jump)
+          pc += inst.imm;
+        else
+          pc += 4;
+      } else {
+        pc += 4;
+      }
+      inst_queue_next.push(InstQueueItem{inst, inst_pc, predict_jump});
     }
   }
 
@@ -585,7 +643,7 @@ class Simulator {
     if (inst.NeedWriteReg()) {
       issue_to_reg.Set(issue_to_reg_t{.reg_id = inst.rd, .rob = rob_id});
     }
-    issue_to_rob.Set(ReorderBufferItem{false, inst, inst.rd, rs_id, slb_id});
+    issue_to_rob.Set(ReorderBufferItem{false, inst, inst.rd, rs_id, slb_id, it.predict_jump});
 
 #ifdef LTC
     printf("issue rob_id:%d rs:%d slb:%d ", rob_id, rs_id, slb_id);
@@ -594,7 +652,7 @@ class Simulator {
     inst_queue_next.pop();
   }
   void UpdateValueInRS(u32 rob_id, u32 val) {
-    for (u32 i = 0; i < RS_SIZE; ++i) {
+    for (u32 i = 0; i < kReservationStationSize; ++i) {
       if (rs_prev[i].ready) continue;
       if (rs_prev[i].rs1_rob == rob_id) rs_next[i].rs1_rob = 0, rs_next[i].rs1_val = val;
       if (rs_prev[i].rs2_rob == rob_id) rs_next[i].rs2_rob = 0, rs_next[i].rs2_val = val;
@@ -626,7 +684,7 @@ class Simulator {
     */
     rs_to_ex.Reset();
     if (signal.clear_all) {
-      for (u32 i = 0; i < RS_SIZE; ++i) rs_next[i].ready = true;
+      for (u32 i = 0; i < kReservationStationSize; ++i) rs_next[i].ready = true;
       return;
     }
     if (issue_to_rs) {
@@ -649,7 +707,7 @@ class Simulator {
       UpdateValueInRS(slb_to_rs_prev->rob_id, slb_to_rs_prev->val);
     }
 
-    for (u32 i = 0; i < RS_SIZE; ++i) {
+    for (u32 i = 0; i < kReservationStationSize; ++i) {
       const auto &it = rs_prev[i];
       if (it.ready) continue;
       if (it.rs1_rob == 0 && it.rs2_rob == 0) {
@@ -676,7 +734,7 @@ class Simulator {
       if (reg.rob == commit_to_reg->rob_id) reg.rob = 0;
     }
     if (signal.clear_all) {  // !after commit, before issue
-      for (u32 i = 0; i < REG_SIZE; ++i) reg_next[i].rob = 0;
+      for (u32 i = 0; i < kRegisterSize; ++i) reg_next[i].rob = 0;
       return;
     }
     if (issue_to_reg) {
@@ -847,7 +905,16 @@ class Simulator {
       if (rob_to_commit->inst.NeedWriteReg()) {
         commit_to_reg.Set(commit_to_reg_t{rob_to_commit->reg_id, rob_to_commit->rob_id, rob_to_commit->result.value});
       }
-      if (rob_to_commit->inst.IsJumpBranch() && rob_to_commit->result.jump) {
+      if (rob_to_commit->inst.IsBranch()) {
+
+        if (rob_prev[rob_to_commit->rob_id].predict_jump != rob_to_commit->result.jump) {
+          signal.clear_all = 1;
+          pc = rob_to_commit->result.pc;
+          predictor.CountResult(false);
+        } else {
+          predictor.CountResult(true);
+        }
+      } else if (rob_to_commit->inst.inst_type == Instruction::JALR) {
         signal.clear_all = 1;
         pc = rob_to_commit->result.pc;
       }
