@@ -252,8 +252,18 @@ class RISC_V {
     }
     InstFormat inst_format = get_format[inst_type];
     imm = GetImm(inst, inst_format);
+#ifdef LTC
     printf("inst %08X [%s]%s, rs1: %d, rs2: %d, imm: %d, rd:%d\n", inst, inst_format_name[inst_format],
         inst_type_name[inst_type], rs1, rs2, imm, rd);
+#endif  // LTC
+#ifdef LTC_REG
+    if (inst_format != S && inst_format != B && rd != 0) {
+      for (u32 i = 0; i < 32; ++i) {
+        printf("%d ", reg[i]);
+      }
+      puts("");
+    }
+#endif  // LTC_REG
     (this->*(Do[inst_type]))();
   }
   void DoLUI() {

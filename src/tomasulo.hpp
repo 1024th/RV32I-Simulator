@@ -363,7 +363,7 @@ class Simulator {
     Instruction inst;
     u32 rs1_val, rs1_rob, rs2_val, rs2_rob, rd_rob, time;
     u32 imm;
-    bool committed;
+    bool committed, busy = false;
   };
 
   LoopQueue<InstQueueItem, kInstQueueSize> inst_queue_prev, inst_queue_next;
@@ -431,7 +431,13 @@ class Simulator {
     u32 rob_id;
     ex_result_t result;
   };
-  Wire<ex_to_rob_t> ex_to_rob, slb_to_rob_prev, slb_to_rob_next;
+  Wire<ex_to_rob_t> ex_to_rob;
+  struct slb_to_rob_t {
+    u32 rob_id;
+    bool is_load;
+    ex_result_t result;
+  };
+  Wire<slb_to_rob_t> slb_to_rob_prev, slb_to_rob_next;
 
   struct rs_to_ex_t {
     Instruction inst;
@@ -524,7 +530,7 @@ class Simulator {
       */
 
 #ifdef LTC
-      if (cycle > 10000) {
+      if (cycle > 1000) {
         puts("Infinite loop!");
         break;
       }
@@ -831,7 +837,10 @@ class Simulator {
       const auto &it = slb_prev.front();
       if (it.rs1_rob == 0 && it.rs2_rob == 0) {
         if (it.inst.IsStore() && !it.committed) {  // uncommitted store
-          slb_to_rob_next.Set(ex_to_rob_t{.rob_id = it.rd_rob});
+          if (!it.busy) {
+            slb_to_rob_next.Set(slb_to_rob_t{.rob_id = it.rd_rob, .is_load = false});
+            slb_next.front().busy = true;
+          }
         } else if (it.time > 1) {
           --slb_next.front().time;
         } else {
@@ -843,7 +852,7 @@ class Simulator {
 #endif  // LTC
           slb_next.pop();
           if (it.inst.IsLoad()) {
-            slb_to_rob_next.Set(ex_to_rob_t{it.rd_rob, result});
+            slb_to_rob_next.Set(slb_to_rob_t{it.rd_rob, true, result});
             slb_to_rs_next.Set(ex_to_rs_t{it.rd_rob, result.value});
             slb_to_slb_next.Set(ex_to_slb_t{it.rd_rob, result.value});
           }
@@ -882,7 +891,7 @@ class Simulator {
       rob_next[ex_to_rob->rob_id].ready = true;
     }
     if (slb_to_rob_prev) {
-      rob_next[slb_to_rob_prev->rob_id].result = slb_to_rob_prev->result;
+      if (slb_to_rob_prev->is_load) rob_next[slb_to_rob_prev->rob_id].result = slb_to_rob_prev->result;
       rob_next[slb_to_rob_prev->rob_id].ready = true;
     }
 
@@ -904,9 +913,14 @@ class Simulator {
     if (rob_to_commit) {
       if (rob_to_commit->inst.NeedWriteReg()) {
         commit_to_reg.Set(commit_to_reg_t{rob_to_commit->reg_id, rob_to_commit->rob_id, rob_to_commit->result.value});
+#ifdef LTC_REG
+        for (u32 i = 0; i < kRegisterSize; ++i) {
+          printf("%d ", reg_prev[i].val);
+        }
+        puts("");
+#endif  // LTC_REG
       }
       if (rob_to_commit->inst.IsBranch()) {
-
         if (rob_prev[rob_to_commit->rob_id].predict_jump != rob_to_commit->result.jump) {
           signal.clear_all = 1;
           pc = rob_to_commit->result.pc;
